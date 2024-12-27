@@ -7,140 +7,132 @@
 #include <stdio.h>
 #include <string.h>
 
-const int MAX_CLIENTS = 1;
-const int LISTEN_PORT = 1337;
+const int MAX_CLIENTS = 2;
 
-// Signal variable, can be changed by external events
-volatile sig_atomic_t wasSignal = 0;
-
+volatile sig_atomic_t signalFlag = 0;
 
 typedef struct {
-    int connfd;
+    int socket;
     struct sockaddr_in addr;
 } client_t;
 
-
-void signalHandler(int r){
-    wasSignal = 1;
-}
-
-
-void printClientAdd(client_t *client) {
+void printClientInfo(client_t *client){
     printf("[%s:%d]", inet_ntoa(client->addr.sin_addr), htons(client->addr.sin_port));
 }
 
+void handleSigHup(int signal) {
+    signalFlag = 1;
+}
 
-// SIGHUP handler
-void setupSignalHandler(sigset_t *origMask) {
+void configureSignalHandler(sigset_t *prevMask) {
     struct sigaction sa;
     sigaction(SIGHUP, NULL, &sa);
-    sa.sa_handler = signalHandler;
-    sa.sa_flags |= SA_RESTART;
+    // Set handler func
+    sa.sa_handler = handleSigHup;
+    sa.sa_flags |= SA_RESTART; 
     sigaction(SIGHUP, &sa, NULL);
 
+    // Blocking SIGHUP
     sigset_t blockedMask;
     sigemptyset(&blockedMask);
-    sigaddset (&blockedMask, SIGHUP);
-    sigprocmask(SIG_BLOCK, &blockedMask, origMask);
+    sigaddset(&blockedMask, SIGHUP);
+    sigprocmask(SIG_BLOCK, &blockedMask, prevMask);
 }
 
+// TCP-server initialization
+int initializeServer(int port) {
+    struct sockaddr_in serverAddr;
+    memset(&serverAddr, 0, sizeof(serverAddr));
+    
+    int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSocket < 0) {
+        perror("Socket creation error!");
+        exit(EXIT_FAILURE);
+    }
 
-// TCP Server
-int create_server(int port) {
-    int sockfd;
-    struct sockaddr_in servaddr;
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd == -1) {
-        puts("Socket creation failed\n");
-        exit(-1);
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    serverAddr.sin_port = htons(port);
+
+    if (bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) != 0) {
+        perror("Socket binding error!");
+        close(serverSocket);
+        exit(EXIT_FAILURE);
     }
-    memset(&servaddr, 0, sizeof(servaddr));
-    servaddr.sin_family = AF_INET;
-    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    servaddr.sin_port = htons(port);
-    if ((bind(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr))) != 0) {
-        puts("Socket bind failed\n");
-        exit(-1);
+
+    if (listen(serverSocket, MAX_CLIENTS) != 0) {
+        perror("Socket listening error!");
+        close(serverSocket);
+        exit(EXIT_FAILURE);
     }
-    if ((listen(sockfd, MAX_CLIENTS)) != 0) {
-        puts("Listen failed\n");
-        exit(-1);
-    }
-    return sockfd;
+
+    return serverSocket;
 }
 
+int handleServerConnections(int serverSocket, sigset_t prevSignalMask) {
+    client_t clients[MAX_CLIENTS];
+    int clientCount = 0;
+    char messageBuffer[1024] = {0};
 
-// Driver code
-int _main(int sockfd,  sigset_t origSigMask) {
-    client_t clients[MAX_CLIENTS+1];
-    int active_clients = 0;
-    char buffer[1024] = {0};
-     while(true) {
-
-        // New client init
-        if (wasSignal) {
-            wasSignal = 0;
-            puts("Clients: ");
-            for (int i = 0; i < active_clients; i++) {
-                printClientAdd(clients);
-                puts(" ");
-            }
-            puts("\n");
+    while (1) {
+        // SIGHUP catch
+        if (signalFlag) {
+	        puts("Signal received!");
+            signalFlag = 0;
         }
 
-        // Link FD with socket
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(sockfd, &fds);
-        int maxFd = sockfd;
+        // Preparing descriptors for pselect()
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(serverSocket, &readfds);
+        int maxFd = serverSocket;
 
-        for (int i = 0; i < active_clients; i++) {
-            FD_SET(clients[i].connfd, &fds);
-            if(clients[i].connfd > maxFd) {
-                maxFd = clients[i].connfd;
+        // Adding clients' descriptors
+        for (int i = 0; i < clientCount; i++) {
+            FD_SET(clients[i].socket, &readfds);
+            if (clients[i].socket > maxFd) {
+                maxFd = clients[i].socket;
             }
         }
 
-        // Signal handling with race-safe pselect() call
-        if (pselect (maxFd + 1, &fds, NULL, NULL, NULL, &origSigMask) < 0 ) {
-            if (errno == EINTR) {
-                continue;
-            }
+        // Waiting for events
+        if (pselect(maxFd + 1, &readfds, NULL, NULL, NULL, &prevSignalMask) == -1) {
+            // Ignore signals interruption
+            if (errno == EINTR) continue;
             return -1;
         }
 
-        // Connect client
-        if (FD_ISSET(sockfd, &fds) && active_clients < MAX_CLIENTS) {
-            client_t *client = &clients[active_clients];
-            socklen_t len = sizeof(client->addr);
-            int connfd = accept(sockfd, (struct sockaddr*)&client->addr, &len);
-            if (connfd >= 0) {
-                client->connfd = connfd;
-                printClientAdd(client);
-                puts(" Connected!\n");
-                active_clients++;
-            }
-            else {
-                printf("Accept error: %s\n", strerror(errno));
+        // New client handling
+        if (FD_ISSET(serverSocket, &readfds) && clientCount < MAX_CLIENTS) {
+            client_t *client = &clients[clientCount];
+            socklen_t addrLen = sizeof(client->addr);
+            int newSocket = accept(serverSocket, (struct sockaddr*)&client->addr, &addrLen);
+            if (newSocket >= 0) {
+                printClientInfo(client);
+                puts(" connected!");
+                client->socket = newSocket;
+                clientCount++;
+            } else {
+                perror("accept() error!");
             }
         }
 
-        // Read client data into buffer
-        for (int i = 0; i < active_clients; i++) {
+        // Read from client
+        for (int i = 0; i < clientCount; i++) {
             client_t *client = &clients[i];
-            if (FD_ISSET(client->connfd, &fds)) {
-                int read_len = read(client->connfd, &buffer, 1023);
-                if (read_len > 0) {
-                    buffer[read_len - 1] = 0;
-                    printClientAdd(client);
-                    printf(" %s\n", buffer);
-                }
-                else {
-                    close(client->connfd);
-                    printClientAdd(client);
-                    puts(" Connection closed\n");
-                    clients[i] = clients[active_clients - 1];
-                    active_clients--;
+            if (FD_ISSET(client->socket, &readfds)) {
+                int bytesRead = read(client->socket, messageBuffer, sizeof(messageBuffer) - 1);
+                if (bytesRead > 0) {
+                    // Terminate string
+                    messageBuffer[bytesRead] = '\0';
+                    printClientInfo(client);
+                    printf(" said: %s", messageBuffer);
+                } else {
+                    close(client->socket);
+                    printClientInfo(client);
+                    puts(" closed!");
+                    clients[i] = clients[clientCount - 1];
+                    clientCount--;
                     i--;
                 }
             }
@@ -149,14 +141,16 @@ int _main(int sockfd,  sigset_t origSigMask) {
 }
 
 int main() {
-    int sockfd = create_server(LISTEN_PORT);
-    puts("Listening...\n");
+    int serverSocket = initializeServer(1488);
+    puts("TCP server up!");
 
-    sigset_t origSigMask;
-    setupSignalHandler(&origSigMask);
+    sigset_t prevSignalMask;
+    configureSignalHandler(&prevSignalMask);
 
-    int res = _main(sockfd, origSigMask);
-    if (res == -1){
-        puts("pselect failed\n");
+    int result = handleServerConnections(serverSocket, prevSignalMask);
+    if (result == -1) {
+        perror("pselect() error!");
     }
+
+    return 0;
 }
